@@ -1,0 +1,191 @@
+:root {
+  /* New Professional Light Theme Variables */
+  /* This variable is replaced by the background image in the body tag */
+  --msger-bg: rgba(255, 255, 255, 0.95); /* Semi-transparent white chat box */
+  --border: 1px solid #dcdcdc; /* Light gray border */
+  --left-msg-bg: #f1f6f9; /* Off-white/light gray for bot messages */
+  --right-msg-bg: #007bff; /* Primary blue for user messages */
+  --shadow: 0 8px 30px rgba(0, 0, 0, 0.2); /* Stronger, professional shadow */
+  --header-grad: linear-gradient(90deg, #007bff, #00c6ff); /* Professional blue gradient */
+  --text-color: #333333; /* Dark text for readability */
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+  /* Clean, professional font */
+  font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+}
+
+body {
+  height: 100vh;
+  /* --- NEW PROFESSIONAL BACKGROUND --- */
+  background-image: url('https://wallpapers.com/images/high/cool-medical-and-health-symbols-yk9ofybop75souw0.webp');
+  background-size: cover;
+  background-position: center;
+  background-attachment: fixed;
+  /* ----------------------------------- */
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  color: var(--text-color);
+}
+
+.msger {
+  width: 90%;
+  max-width: 800px;
+  height: 90vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--msger-bg); /* Use semi-transparent white over background image */
+  backdrop-filter: blur(5px); /* Add a subtle blur to make chat box stand out */
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+  border: var(--border);
+  overflow: hidden;
+}
+
+/* Header */
+.msger-header {
+  text-align: center;
+  background: var(--header-grad);
+  color: #fff;
+  padding: 16px;
+  box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+  font-weight: 600;
+}
+
+.msger-header-title {
+  font-size: 1.4em;
+  letter-spacing: 1px;
+}
+
+/* Chat Section */
+.msger-chat {
+  flex: 1;
+  overflow-y: auto;
+  padding: 15px;
+  display: flex;
+  flex-direction: column;
+  background: rgba(255, 255, 255, 0.8); /* Slightly more transparent chat area */
+  scroll-behavior: smooth;
+}
+
+.msger-chat::-webkit-scrollbar {
+  width: 6px;
+}
+.msger-chat::-webkit-scrollbar-thumb {
+  background: #aab8c2;
+  border-radius: 10px;
+}
+
+.msg {
+  display: flex;
+  align-items: flex-end;
+  margin: 10px 0;
+  animation: fadeIn 0.4s ease-out;
+}
+
+@keyframes fadeIn {
+  from {opacity: 0; transform: translateY(10px);}
+  to {opacity: 1; transform: translateY(0);}
+}
+
+.msg-img {
+  width: 40px;
+  height: 40px;
+  background-repeat: no-repeat;
+  background-size: cover;
+  background-position: center;
+  border-radius: 50%;
+  margin: 0 8px;
+  border: 2px solid #007bff; /* Blue border for bot/user image */
+}
+
+.msg-bubble {
+  max-width: 75%;
+  padding: 12px 15px;
+  border-radius: 18px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+  line-height: 1.4;
+}
+
+.msg-info {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 4px;
+  font-size: 0.75em;
+}
+
+.msg-info-name {
+  font-weight: 600;
+  color: #007bff; /* Blue for names */
+}
+
+/* Left (Bot) Message */
+.left-msg .msg-bubble {
+  background: var(--left-msg-bg);
+  color: var(--text-color);
+  border-bottom-left-radius: 4px;
+}
+.left-msg .msg-info-name {
+    color: #4a4a4a;
+}
+
+/* Right (User) Message */
+.right-msg {
+  flex-direction: row-reverse;
+}
+
+.right-msg .msg-bubble {
+  background: var(--right-msg-bg);
+  color: #fff; /* White text on blue background */
+  border-bottom-right-radius: 4px;
+}
+.right-msg .msg-info-name {
+    color: #ffffff;
+}
+
+.right-msg .msg-img {
+  margin-left: 8px;
+}
+
+/* Input Area */
+.msger-inputarea {
+  display: flex;
+  padding: 15px;
+  background: #f7f7f7; /* Very light gray input area */
+  border-top: var(--border);
+}
+
+.msger-input {
+  flex: 1;
+  border: 1px solid #ced4da;
+  border-radius: 20px;
+  padding: 10px 15px;
+  background: #ffffff;
+  font-size: 1em;
+  outline: none;
+  transition: border-color 0.2s ease;
+}
+
+.msger-input:focus {
+    border-color: #007bff;
+}
+
+.msger-send-btn {
+  background: #007bff; /* Primary blue send button */
+  color: white;
+  font-weight: 500;
+  padding: 10px 18px;
+  border-radius: 20px;
+  border: none;
+  margin-left: 8px;
+  cursor: pointer;
+  transition: background 0.2s ease;
+}
+
+.msger-send-btn:hover {
+  background: #0056b3;
+}
