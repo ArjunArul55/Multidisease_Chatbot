@@ -1,8 +1,9 @@
-numpy
-nltk
-spacy
-joblib
-pandas
 Flask
-scikit_learn
 gunicorn
+numpy
+pandas
+joblib
+scikit-learn
+spacy
+nltk
+google-genai
