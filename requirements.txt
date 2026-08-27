@@ -1,9 +1,9 @@
 Flask
 gunicorn
 numpy
-pandas
-joblib
-scikit-learn
-spacy
 nltk
+spacy
+joblib
+pandas
+scikit-learn==1.7.1
 google-genai
