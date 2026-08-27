@@ -166,6 +166,29 @@ Return ONLY one category.
     result = ask_gemini(prompt)
 
     if not result:
+        # If Gemini is unavailable, use the local symptom matcher as
+        # the fallback so real medical messages still enter the
+        # prediction pipeline.
+        try:
+            if local_symptom_fallback(message):
+                return "medical"
+        except Exception:
+            pass
+
+        value = message.lower().strip()
+
+        if value in {"hi", "hello", "hey", "good morning", "good evening"}:
+            return "greeting"
+
+        if value in {"yes", "yeah", "yep", "yup", "sure", "ok", "okay"}:
+            return "yes"
+
+        if value in {"no", "nope", "nah"}:
+            return "no"
+
+        if value in {"bye", "quit", "exit", "stop", "end"}:
+            return "quit"
+
         return "conversation"
 
     result = result.lower().strip()
@@ -188,38 +211,42 @@ Return ONLY one category.
 
 def extract_symptoms_from_message(message):
     """
-    Use Gemini to convert natural language into symptoms
-    that exist in the project's dataset.
+    Use Gemini to extract symptoms from natural language and map them to
+    the exact symptom column names used by the existing ML model.
     """
     if not message:
         return []
 
-    symptom_names = ", ".join(all_symp_col)
+    # Human-readable -> exact dataset column mapping.
+    readable_to_column = {}
+    for symptom in all_symp_col:
+        readable = clean_symp(symptom).lower().strip()
+        readable_to_column[readable] = symptom
+
+    supported = list(readable_to_column.keys())
 
     prompt = f"""
-You are a symptom extraction system.
+You are the symptom-extraction component of a medical symptom prediction
+application.
 
 User message:
 "{message}"
 
-These are the ONLY symptoms supported by the machine-learning model:
+Supported symptoms in the machine-learning dataset:
+{", ".join(supported)}
 
-{symptom_names}
+Task:
+- Identify only symptoms that the user actually describes.
+- Understand natural language, synonyms, spelling variations, and phrases.
+- Map the user's words to the closest supported symptom.
+- Do not diagnose a disease.
+- Do not invent symptoms.
+- Do not infer a symptom merely because it is commonly associated with
+  another symptom.
+- Return JSON only.
 
-Find the symptoms clearly mentioned by the user.
-
-Rules:
-1. Map natural language to the closest supported symptom.
-2. Do not invent symptoms.
-3. Do not diagnose a disease.
-4. Only return symptoms from the supplied list.
-5. Return JSON only, no preamble, no markdown formatting.
-
-Required format:
-
-{{
-    "symptoms": ["symptom1", "symptom2"]
-}}
+Format:
+{{"symptoms":["supported symptom name"]}}
 """
 
     result = ask_gemini(prompt)
@@ -228,28 +255,106 @@ Required format:
         return []
 
     try:
-        result = result.replace("```json", "")
-        result = result.replace("```", "")
-        result = result.strip()
+        cleaned = result.replace("```json", "").replace("```", "").strip()
+        data = json.loads(cleaned)
+        raw_symptoms = data.get("symptoms", [])
 
-        data = json.loads(result)
-
-        symptoms = data.get("symptoms", [])
-
-        if not isinstance(symptoms, list):
+        if not isinstance(raw_symptoms, list):
             return []
 
-        valid_symptoms = set(all_symp_col)
+        extracted = []
 
-        return [
-            symptom for symptom in symptoms
-            if symptom in valid_symptoms
-        ]
+        # First: exact human-readable match.
+        for item in raw_symptoms:
+            if not isinstance(item, str):
+                continue
+
+            candidate = item.lower().strip()
+
+            if candidate in readable_to_column:
+                col = readable_to_column[candidate]
+                if col not in extracted:
+                    extracted.append(col)
+                continue
+
+            # Second: normalized comparison.
+            candidate_processed = preprocess(candidate)
+            for readable, col in readable_to_column.items():
+                if candidate_processed == preprocess(readable):
+                    if col not in extracted:
+                        extracted.append(col)
+                    break
+
+        print("Gemini extracted symptoms:", raw_symptoms)
+        print("Mapped dataset symptoms:", extracted)
+        return extracted
 
     except Exception as e:
         print("Symptom extraction error:", e)
+        print("Gemini raw response:", result)
         return []
 
+
+def local_symptom_fallback(message):
+    """
+    Local fallback when Gemini is unavailable or returns no valid symptom.
+    Uses exact/normalized substring matching and fuzzy similarity.
+    """
+    if not message:
+        return []
+
+    import difflib
+
+    text = clean_symp(message).lower()
+    processed_text = preprocess(text)
+    matches = []
+
+    # Exact human-readable phrase match.
+    for symptom in all_symp_col:
+        readable = clean_symp(symptom).lower().strip()
+        if readable and readable in text:
+            matches.append(symptom)
+
+    # Normalized phrase match.
+    for symptom in all_symp_col:
+        readable = clean_symp(symptom).lower().strip()
+        processed = preprocess(readable)
+
+        if processed and processed in processed_text:
+            matches.append(symptom)
+
+    # Fuzzy match for short natural phrases.
+    words = text.split()
+    for symptom in all_symp_col:
+        readable = clean_symp(symptom).lower().strip()
+        if not readable:
+            continue
+
+        score = difflib.SequenceMatcher(None, text, readable).ratio()
+
+        if score >= 0.82:
+            matches.append(symptom)
+
+        # Also compare individual n-grams for phrases such as
+        # "pain in my stomach" -> "stomach pain".
+        symptom_words = readable.split()
+        n = len(symptom_words)
+
+        if n > 0 and len(words) >= n:
+            for i in range(len(words) - n + 1):
+                chunk = " ".join(words[i:i+n])
+                if difflib.SequenceMatcher(None, chunk, readable).ratio() >= 0.88:
+                    matches.append(symptom)
+                    break
+
+    # Preserve dataset order and remove duplicates.
+    unique = []
+    for symptom in all_symp_col:
+        if symptom in matches and symptom not in unique:
+            unique.append(symptom)
+
+    print("Local symptom fallback:", unique)
+    return unique
 
 def generate_ai_response(disease, symptoms):
     """
@@ -559,6 +664,216 @@ def related_sym(psym1):
     return s
 
 
+# ============================================================
+# ROBUST CHATBOT CONVERSATION ENGINE
+# ============================================================
+
+def normalize_yes_no(message):
+    """Return True/False/None for natural-language yes/no answers."""
+    if not message:
+        return None
+
+    value = message.lower().strip()
+
+    yes_words = {
+        "yes", "yeah", "yep", "yup", "sure", "correct", "okay", "ok",
+        "true", "i do", "i have", "that's right", "that is right"
+    }
+
+    no_words = {
+        "no", "nope", "nah", "not", "not really", "false", "i don't",
+        "i do not", "i haven't", "i have not"
+    }
+
+    if value in yes_words:
+        return True
+
+    if value in no_words:
+        return False
+
+    # Handle natural variants such as "yes, I do" or "no, I don't".
+    if value.startswith(("yes ", "yeah ", "yep ", "sure ")):
+        return True
+
+    if value.startswith(("no ", "nope ", "nah ")):
+        return False
+
+    return None
+
+
+def parse_age(message):
+    """Extract an age safely. Gemini is used first, regex is the fallback."""
+    if not message:
+        return None
+
+    match = re.search(r"\b(\d{1,3})\b", message)
+    if match:
+        age = int(match.group(1))
+        if 1 <= age <= 120:
+            return age
+
+    result = ask_gemini(f"""
+Extract the person's age from this message:
+
+"{message}"
+
+Return ONLY the integer age.
+If no valid age is present, return 0.
+""")
+
+    if result:
+        match = re.search(r"\b(\d{1,3})\b", result)
+        if match:
+            age = int(match.group(1))
+            if 1 <= age <= 120:
+                return age
+
+    return None
+
+
+def is_quit(message):
+    if not message:
+        return False
+
+    return message.lower().strip() in {
+        "q", "quit", "exit", "bye", "stop", "end", "close"
+    }
+
+
+def reset_diagnostic_keep_profile():
+    """Keep profile information and start another assessment."""
+    name = session.get("name", "User")
+    age = session.get("age")
+    gender = session.get("gender")
+
+    session.clear()
+    session["name"] = name
+    session["age"] = age
+    session["gender"] = gender
+    session["step"] = "FS"
+    session["all"] = []
+    session["asked"] = []
+    session["diseases"] = []
+
+    return name
+
+
+def start_new_assessment():
+    session["all"] = []
+    session["asked"] = []
+    session["diseases"] = []
+    session.pop("dis", None)
+    session.pop("testpred", None)
+    session.pop("symv", None)
+    session.pop("disease", None)
+    session["step"] = "FS"
+
+
+def get_candidate_diseases(symptoms):
+    """Return candidate diseases, safely."""
+    if not symptoms:
+        return []
+
+    try:
+        return possible_diseases(symptoms)
+    except Exception as e:
+        print("Disease filtering error:", e)
+        return []
+
+
+def add_symptoms(symptoms):
+    """Add valid dataset symptoms to session without duplicates."""
+    current = session.get("all", [])
+
+    for symptom in symptoms:
+        if symptom in all_symp_col and symptom not in current:
+            current.append(symptom)
+
+    session["all"] = current
+
+
+def find_next_disease_question():
+    """
+    Find an unasked symptom belonging to the current candidate disease.
+    """
+    diseases = session.get("diseases", [])
+    current = session.get("all", [])
+    asked = session.get("asked", [])
+
+    if not diseases:
+        return None
+
+    # Start with the first candidate disease.
+    current_disease = diseases[0]
+    session["dis"] = current_disease
+
+    disease_symptoms = symVONdisease(df_tr, current_disease)
+
+    for symptom in disease_symptoms:
+        if symptom not in current and symptom not in asked:
+            asked.append(symptom)
+            session["asked"] = asked
+            return symptom
+
+    return None
+
+
+def predict_current_symptoms():
+    """
+    Run the existing KNN model using the exact feature order expected by it.
+    """
+    symptoms = session.get("all", [])
+
+    if not symptoms:
+        return None
+
+    try:
+        vector = OHV(symptoms, all_symp_col)
+        prediction = knn_clf.predict(vector)
+        return prediction[0] if len(prediction) else None
+    except Exception as e:
+        print("KNN prediction error:", e)
+        return None
+
+
+def build_final_prediction_response(disease_name):
+    """Generate a safe, friendly prediction message."""
+    symptoms = session.get("all", [])
+
+    response = generate_ai_response(
+        disease_name,
+        symptoms
+    )
+
+    if response:
+        return response
+
+    return (
+        "The machine-learning model predicts <b>" +
+        str(disease_name) +
+        "</b> based on the symptoms you provided. "
+        "This is not a confirmed medical diagnosis."
+    )
+
+
+def save_assessment():
+    """
+    Save only the existing application's assessment record.
+    For production, replace DATA.json with a proper database.
+    """
+    try:
+        y = {
+            "Name": session.get("name", "User"),
+            "Age": session.get("age"),
+            "Gender": session.get("gender"),
+            "Disease": session.get("disease"),
+            "Sympts": session.get("all", [])
+        }
+        write_json(y)
+    except Exception as e:
+        print("Could not save assessment:", e)
+
+
 @app.route("/")
 def home():
     return render_template("home.html")
@@ -566,94 +881,106 @@ def home():
 
 @app.route("/get")
 def get_bot_response():
-    s = request.args.get('msg')
+    s = request.args.get("msg", "").strip()
 
-    if "step" in session:
-        if session["step"] == "Q_C":
-            name = session["name"]
-            age = session["age"]
-            gender = session["gender"]
+    if not s:
+        return "Please enter a message."
+
+    # --------------------------------------------------------
+    # GLOBAL QUIT HANDLING
+    # --------------------------------------------------------
+    if is_quit(s):
+        name = session.get("name", "User")
+        session.clear()
+        return (
+            "Thank you, " + str(name) +
+            ", for using the medical assistant. "
+            "Please consult a qualified healthcare professional "
+            "for diagnosis or treatment."
+        )
+
+    # --------------------------------------------------------
+    # INITIAL / NO SESSION
+    # --------------------------------------------------------
+    if "step" not in session:
+
+        # Preserve the original application's OK -> name flow.
+        if s.upper() == "OK":
             session.clear()
-            if s == "q":
-                return "Thank you for using our web site Mr/Ms " + name
-            else:
-                session["step"] = "FS"
-                session["name"] = name
-                session["age"] = age
-                session["gender"] = gender
+            session["step"] = "name"
+            return "What is your name?"
 
-    if s.upper() == "OK":
-        return "What is your name ?"
-
-    if 'name' not in session and 'step' not in session:
-
-        # Handle first-message intent before treating the input as a name.
         intent = classify_intent(s)
 
         if intent == "greeting":
             return (
-                "Hello! 👋 I'm your medical assistant. "
-                "I can help analyze your symptoms using our "
-                "machine-learning model. Please tell me what "
-                "symptoms you're experiencing."
+                "Hello! 👋 I'm Medibot. "
+                "I can help analyze symptoms using a machine-learning "
+                "model. Tell me what symptoms you're experiencing."
+            )
+
+        if intent == "quit":
+            session.clear()
+            return "Alright, take care!"
+
+        # Always try symptom extraction before rejecting a message as
+        # conversation/irrelevant. This makes natural language robust.
+        extracted = extract_symptoms_from_message(s)
+
+        if not extracted:
+            extracted = local_symptom_fallback(s)
+
+        if extracted:
+            add_symptoms(extracted)
+            session["name"] = "User"
+            session["step"] = "age"
+
+            readable = ", ".join(
+                clean_symp(x) for x in extracted
+            )
+
+            return (
+                "I detected these symptoms: <b>" +
+                readable +
+                "</b>.<br>How old are you?"
             )
 
         if intent == "irrelevant":
             return (
-                "I'm designed to help with health-related symptoms "
-                "and disease prediction. Please tell me about any "
-                "symptoms you're experiencing."
+                "I'm designed for health-related symptom assessment. "
+                "I can't help with unrelated topics. "
+                "Please describe a health symptom or concern."
             )
 
         if intent == "conversation":
             return ai_fallback_response(
                 s,
-                "The user has not started a diagnosis yet."
+                "The user has not started an assessment yet."
             )
 
-        if intent == "medical":
-            extracted = extract_symptoms_from_message(s)
-
-            if extracted:
-                session["all"] = extracted
-                session["asked"] = []
-                session["name"] = "User"
-                session["step"] = "age"
-
-                return (
-                    "I detected these symptoms: "
-                    + ", ".join(clean_symp(x) for x in extracted)
-                    + ". How old are you?"
-                )
-
-            return (
-                "I couldn't identify a supported symptom. "
-                "Please describe what you are feeling."
-            )
-
-        session['name'] = s
-        session['step'] = "age"
+        # If it is neither medical nor a known command, treat it as a name.
+        session["name"] = s
+        session["step"] = "age"
         return "How old are you?"
 
+    # --------------------------------------------------------
+    # NAME
+    # --------------------------------------------------------
+    if session["step"] == "name":
+        if len(s) < 1:
+            return "Please enter your name."
+
+        session["name"] = s
+        session["step"] = "age"
+        return "How old are you?"
+
+    # --------------------------------------------------------
+    # AGE
+    # --------------------------------------------------------
     if session["step"] == "age":
+        age = parse_age(s)
 
-        try:
-            age_text = ask_gemini(f'''
-Extract the person's age from this message.
-
-Message:
-{s}
-
-Return ONLY the integer age.
-If no valid age is present, return 0.
-''')
-
-            age = int(age_text.strip()) if age_text else 0
-
-        except Exception:
-            age = 0
-
-        if age < 1 or age > 120:
+        if age is None:
             return "Please enter your age, for example: 21."
 
         session["age"] = age
@@ -661,366 +988,386 @@ If no valid age is present, return 0.
 
         return "Can you specify your gender?"
 
+    # --------------------------------------------------------
+    # GENDER
+    # --------------------------------------------------------
     if session["step"] == "gender":
-        session["gender"] = s
-        session["step"] = "Depart"
+        gender = s.strip()
 
-    if session['step'] == "Depart":
-        session['step'] = "BFS"
-        return "Well, Hello again Mr/Ms " + session[
-            "name"] + ", now I will be asking some few questions about your symptoms to see what you should do. Tap S to start diagnostic!"
+        if len(gender) < 1:
+            return "Please specify your gender."
 
-    if session['step'] == "BFS":
-        session['step'] = "FS"
-        return "Can you precise your main symptom Mr/Ms " + session["name"] + " ?"
+        session["gender"] = gender
+        session["step"] = "FS"
 
-    if session['step'] == "FS":
-        # AI-powered guard: catch greetings / off-topic / quit / meta
-        # questions before running them through the symptom pipeline.
-        intent = classify_intent(s)
-        if intent == "quit":
-            session.clear()
-            return "Alright, take care! Come back anytime you'd like a symptom check."
-        if intent in ("greeting", "conversation", "irrelevant"):
-            return ai_fallback_response(s, "The user is expected to describe a symptom at this stage.")
-
-        raw1 = s
-        sym1 = preprocess(s)
-        sim1, psym1 = syntactic_similarity(sym1, all_symp_pr)
-        temp = [sym1, sim1, psym1, raw1]
-        session['FSY'] = temp
-        session['step'] = "SS"
-        if sim1 == 1:
-            session['step'] = "RS1"
-            resp = related_sym(psym1)
-            if resp != 0:
-                return resp
-        else:
-            return "You are probably facing another symptom, if so, can you specify it?"
-
-    if session['step'] == "RS1":
-        temp = session['FSY']
-        psym1 = temp[2]
-        psym1 = psym1[int(s)]
-        temp[2] = psym1
-        session['FSY'] = temp
-        session['step'] = 'SS'
-        return "You are probably facing another symptom, if so, can you specify it?"
-
-    if session['step'] == "SS":
-        raw2 = s
-        sym2 = preprocess(s)
-        sim2 = 0
-        psym2 = []
-        if len(sym2) != 0:
-            intent = classify_intent(s)
-            if intent == "quit":
-                session.clear()
-                return "Alright, take care! Come back anytime you'd like a symptom check."
-            if intent in ("greeting", "conversation", "irrelevant"):
-                return ai_fallback_response(s, "The user was asked if they have another symptom.")
-            sim2, psym2 = syntactic_similarity(sym2, all_symp_pr)
-        temp = [sym2, sim2, psym2, raw2]
-        session['SSY'] = temp
-        session['step'] = "semantic"
-        if sim2 == 1:
-            session['step'] = "RS2"
-            resp = related_sym(psym2)
-            if resp != 0:
-                return resp
-
-    if session['step'] == "RS2":
-        temp = session['SSY']
-        psym2 = temp[2]
-        psym2 = psym2[int(s)]
-        temp[2] = psym2
-        session['SSY'] = temp
-        session['step'] = "semantic"
-
-    if session['step'] == "semantic":
-        temp = session["FSY"]
-        sim1 = temp[1]
-        temp = session["SSY"]
-        sim2 = temp[1]
-        if sim1 == 0 or sim2 == 0:
-            session['step'] = "BFsim1=0"
-        else:
-            session['step'] = 'PD'
-
-    if session['step'] == "BFsim1=0":
-        temp = session["FSY"]
-        sym1 = temp[0]
-        sim1 = temp[1]
-        if sim1 == 0 and len(sym1) != 0:
-            sim1, psym1 = semantic_similarity(sym1, all_symp_pr)
-            temp = session["FSY"]
-            temp[1] = sim1
-            temp[2] = psym1
-            session['FSY'] = temp
-            session['step'] = "sim1=0"
-        else:
-            session['step'] = "BFsim2=0"
-
-    if session['step'] == "sim1=0":
-        temp = session["FSY"]
-        sim1 = temp[1]
-        if sim1 == 0:
-            if "suggested" in session:
-                sugg = session["suggested"]
-                if s == "yes":
-                    psym1 = sugg[0]
-                    sim1 = 1
-                    temp = session["FSY"]
-                    temp[1] = sim1
-                    temp[2] = psym1
-                    session["FSY"] = temp
-                    sugg = []
-                else:
-                    del sugg[0]
-            if "suggested" not in session:
-                sym1 = session["FSY"][0]
-                session["suggested"] = suggest_syn(sym1)
-                sugg = session["suggested"]
-            if len(sugg) > 0:
-                session["suggested"] = sugg
-                msg = "are you experiencing any  " + sugg[0] + "?"
-                return msg
-        if "suggested" in session:
-            del session["suggested"]
-        session['step'] = "BFsim2=0"
-
-    if session['step'] == "BFsim2=0":
-        temp = session["SSY"]
-        sym2 = temp[0]
-        sim2 = temp[1]
-        if sim2 == 0 and len(sym2) != 0:
-            sim2, psym2 = semantic_similarity(sym2, all_symp_pr)
-            temp = session["SSY"]
-            temp[1] = sim2
-            temp[2] = psym2
-            session['SSY'] = temp
-            session['step'] = "sim2=0"
-        else:
-            session['step'] = "TEST"
-
-    if session['step'] == "sim2=0":
-        temp = session["SSY"]
-        sim2 = temp[1]
-        if sim2 == 0:
-            if "suggested_2" in session:
-                sugg = session["suggested_2"]
-                if s == "yes":
-                    psym2 = sugg[0]
-                    sim2 = 1
-                    temp = session["SSY"]
-                    temp[1] = sim2
-                    temp[2] = psym2
-                    session["SSY"] = temp
-                    sugg = []
-                else:
-                    del sugg[0]
-            if "suggested_2" not in session:
-                sym2 = session["SSY"][0]
-                session["suggested_2"] = suggest_syn(sym2)
-                sugg = session["suggested_2"]
-            if len(sugg) > 0:
-                msg = "Are you experiencing " + sugg[0] + "?"
-                session["suggested_2"] = sugg
-                return msg
-        if "suggested_2" in session:
-            del session["suggested_2"]
-        session['step'] = "TEST"
-
-    if session['step'] == "TEST":
-        temp = session["FSY"]
-        sim1 = temp[1]
-        psym1 = temp[2]
-        raw1 = temp[3] if len(temp) > 3 else ""
-        temp = session["SSY"]
-        sim2 = temp[1]
-        psym2 = temp[2]
-        raw2 = temp[3] if len(temp) > 3 else ""
-
-        if sim1 == 0 and sim2 == 0:
-            # Deterministic pipeline (syntactic + semantic similarity)
-            # found nothing. Fall back to Gemini to try to map the raw
-            # free-text messages onto known dataset symptoms.
-            raw_combined = (str(raw1) + " " + str(raw2)).strip()
-            ai_symptoms = extract_symptoms_from_message(raw_combined)
-            if ai_symptoms:
-                session["all"] = ai_symptoms
-                session["asked"] = []
-                session['step'] = 'PD'
-            else:
-                result = None
-                session["offtopic_msg"] = ai_fallback_response(raw_combined) if raw_combined else None
-                session['step'] = "END"
-        else:
-            if sim1 == 0:
-                psym1 = psym2
-                temp = session["FSY"]
-                temp[2] = psym2
-                session["FSY"] = temp
-            if sim2 == 0:
-                psym2 = psym1
-                temp = session["SSY"]
-                temp[2] = psym1
-                session["SSY"] = temp
-            session['step'] = 'PD'
-
-    if session['step'] == 'PD':
-        temp = session["FSY"]
-        sim1 = temp[1]
-        psym1 = temp[2]
-        temp = session["SSY"]
-        sim2 = temp[1]
-        psym2 = temp[2]
-        if "all" not in session:
-            session["asked"] = []
-            session["all"] = [col_dict[psym1], col_dict[psym2]]
-        session["diseases"] = possible_diseases(session["all"])
-        diseases = session["diseases"]
-        if diseases:
-            dis = diseases[0]
-            session["dis"] = dis
-        session['step'] = "for_dis"
-
-    if session['step'] == "DIS":
-        symts = session.get("symv", [])
-        if "symv" in session:
-            if len(s) > 0 and len(symts) > 0:
-                all_sym = session["all"]
-                if s == "yes":
-                    all_sym.append(symts[0])
-                    session["all"] = all_sym
-                if symts:
-                    del symts[0]
-                session["symv"] = symts
-        if "symv" not in session:
-            session["symv"] = symVONdisease(df_tr, session["dis"])
-            symts = session["symv"]
-        if len(symts) > 0:
-            if symts[0] not in session["all"] and symts[0] not in session["asked"]:
-                asked = session["asked"]
-                asked.append(symts[0])
-                session["asked"] = asked
-                msg = "Are you experiencing " + clean_symp(symts[0]) + "?"
-                return msg
-            else:
-                del symts[0]
-                session["symv"] = symts
-                s = ""
-                return get_bot_response()
-        else:
-            PD = possible_diseases(session["all"])
-            diseases = session["diseases"]
-            if diseases and diseases[0] in PD:
-                session["testpred"] = diseases[0]
-                PD.remove(diseases[0])
-            session["diseases"] = PD
-            session['step'] = "for_dis"
-
-    if session['step'] == "for_dis":
-        diseases = session["diseases"]
-        if len(diseases) <= 0:
-            session['step'] = 'PREDICT'
-        else:
-            session["dis"] = diseases[0]
-            session['step'] = "DIS"
-            session["symv"] = symVONdisease(df_tr, session["dis"])
-            return get_bot_response()
-
-    if session['step'] == "PREDICT":
-        result = knn_clf.predict(OHV(session["all"], all_symp_col))
-        session['step'] = "END"
-
-    if session['step'] == "END":
-        if result is not None:
-            if "testpred" in session and result[0] != session["testpred"]:
-                session['step'] = "Q_C"
-                return "as you provide me with few symptoms, I am sorry to announce that I cannot predict your " \
-                       "disease for the moment!!! <br> Can you specify more about what you are feeling or Tap q to " \
-                       "stop the conversation "
-            session['step'] = "Description"
-            session["disease"] = result[0]
+        # If symptoms were already supplied before age/gender,
+        # go directly to prediction flow.
+        if session.get("all"):
             return (
-                "The machine-learning model predicts <b>" + result[0] +
-                "</b> based on the symptoms you provided. "
-                "This is not a confirmed medical diagnosis. "
-                "Tap D to continue with the explanation and precautions."
+                "Thank you. I have your information. "
+                "Let's continue with your symptom assessment."
             )
-        else:
-            offtopic_msg = session.pop("offtopic_msg", None)
-            session['step'] = "Q_C"
-            if offtopic_msg:
-                return offtopic_msg + "<br>Can you specify more about what you are feeling, or tap q to stop the conversation."
-            return ("as you provide me with few symptoms, I am sorry to announce that I cannot predict your "
-                    "disease for the moment!!! <br> Can you specify more about what you are feeling or Tap q to "
-                    "stop the conversation ")
 
-    if session['step'] == "Description":
-        y = {"Name": session["name"], "Age": session["age"], "Gender": session["gender"],
-             "Disease": session["disease"], "Sympts": session["all"]}
-        write_json(y)
-        session['step'] = "Severity"
-
-        # Prefer a Gemini-generated, friendlier explanation of the
-        # prediction; fall back to the raw dataset description if the
-        # API is unavailable.
-        ai_explanation = generate_ai_response(session["disease"], session["all"])
-        if ai_explanation:
-            return ai_explanation + " <br> How many days have you had symptoms?"
-
-        if session["disease"] in description_list.keys():
-            return description_list[session["disease"]] + " \n <br>  How many days have you had symptoms?"
-        else:
-            disease_slug = session["disease"]
-            if " " in disease_slug:
-                disease_slug = disease_slug.replace(" ", "_")
-            return "please visit <a href='" + "https://en.wikipedia.org/wiki/" + disease_slug + "'>  here  </a>"
-
-    if session['step'] == "Severity":
-        session['step'] = 'FINAL'
-        if calc_condition(session["all"], int(s)) == 1:
-            return "you should take the consultation from doctor <br> Tap q to exit"
-        else:
-            msg = 'Nothing to worry about, but you should take the following precautions :<br> '
-            i = 1
-            for e in precautionDictionary.get(session["disease"], []):
-                msg += '\n ' + str(i) + ' - ' + e + '<br>'
-                i += 1
-            msg += ' Tap q to end'
-            return msg
-
-    if session['step'] == "FINAL":
-        session['step'] = "BYE"
         return (
-            "Your symptom assessment is complete. "
-            "Would you like to start another assessment (yes or no)?"
+            "Thank you, Mr/Ms " + str(session["name"]) +
+            ". Please describe your main symptom."
         )
 
-    if session['step'] == "BYE":
-        name = session["name"]
-        age = session["age"]
-        gender = session["gender"]
-        session.clear()
-        if s.lower() == "yes":
-            session["gender"] = gender
-            session["name"] = name
-            session["age"] = age
-            session['step'] = "FS"
-            return "HELLO again Mr/Ms " + session["name"] + " Please tell me your main symptom. "
-        else:
+    # --------------------------------------------------------
+    # FIRST SYMPTOM
+    # --------------------------------------------------------
+    if session["step"] == "FS":
+
+        intent = classify_intent(s)
+
+        if intent == "quit":
+            session.clear()
+            return "Alright, take care!"
+
+        # Try the actual symptom extractor first. This prevents a
+        # classification mistake from blocking a valid symptom.
+        symptoms = extract_symptoms_from_message(s)
+
+        if not symptoms:
+            symptoms = local_symptom_fallback(s)
+
+        if not symptoms and intent in ("greeting", "irrelevant", "conversation"):
+            return ai_fallback_response(
+                s,
+                "The user is expected to describe a medical symptom."
+            )
+
+        if not symptoms:
             return (
-                "Thank you, " + name +
-                ", for using the medical assistant. "
+                "I couldn't identify the symptom. "
+                "Please describe it in another way, for example "
+                "\"I have stomach pain\" or \"my head hurts\"."
+            )
+
+        add_symptoms(symptoms)
+        session["step"] = "SS"
+
+        readable = ", ".join(clean_symp(x) for x in symptoms)
+
+        return (
+            "I understood: <b>" + readable +
+            "</b>. Do you have any other symptoms? "
+            "You can say yes and describe them, or no."
+        )
+
+    # --------------------------------------------------------
+    # SECOND / ADDITIONAL SYMPTOMS
+    # --------------------------------------------------------
+    if session["step"] == "SS":
+
+        yn = normalize_yes_no(s)
+
+        if yn is False:
+            session["step"] = "PD"
+
+        elif yn is True:
+            session["step"] = "MORE_SYMPTOMS"
+            return "Please describe your other symptom(s)."
+
+        else:
+            # Treat any medical-looking message as another symptom.
+            intent = classify_intent(s)
+
+            if intent in ("greeting", "irrelevant", "conversation"):
+                return ai_fallback_response(
+                    s,
+                    "The user was asked whether they have another symptom."
+                )
+
+            if intent == "medical":
+                extracted = extract_symptoms_from_message(s)
+
+                if not extracted:
+                    extracted = local_symptom_fallback(s)
+
+                if extracted:
+                    add_symptoms(extracted)
+                    session["step"] = "PD"
+
+                    return (
+                        "I added: <b>" +
+                        ", ".join(clean_symp(x) for x in extracted) +
+                        "</b>. Let me analyze your symptoms."
+                    )
+
+            return (
+                "Please say <b>yes</b> and describe another symptom, "
+                "or say <b>no</b> if you don't have another symptom."
+            )
+
+        # Continue to disease filtering.
+        return get_bot_response()
+
+    # --------------------------------------------------------
+    # MORE SYMPTOMS
+    # --------------------------------------------------------
+    if session["step"] == "MORE_SYMPTOMS":
+
+        extracted = extract_symptoms_from_message(s)
+
+        if not extracted:
+            extracted = local_symptom_fallback(s)
+
+        if not extracted:
+            return (
+                "I couldn't identify that symptom. "
+                "Please describe it in another way."
+            )
+
+        add_symptoms(extracted)
+        session["step"] = "PD"
+
+        return (
+            "I added: <b>" +
+            ", ".join(clean_symp(x) for x in extracted) +
+            "</b>. Let me analyze your symptoms."
+        )
+
+    # --------------------------------------------------------
+    # FIND CANDIDATE DISEASES
+    # --------------------------------------------------------
+    if session["step"] == "PD":
+
+        symptoms = session.get("all", [])
+        diseases = get_candidate_diseases(symptoms)
+
+        session["diseases"] = diseases
+        session["asked"] = []
+
+        if not diseases:
+            session["step"] = "MORE_IF_NO_MATCH"
+
+            return (
+                "I couldn't find a reliable match from the symptoms "
+                "provided. Please describe another symptom so I can "
+                "narrow the possibilities."
+            )
+
+        session["step"] = "DIS"
+        return get_bot_response()
+
+    # --------------------------------------------------------
+    # ASK DISEASE-SPECIFIC QUESTIONS
+    # --------------------------------------------------------
+    if session["step"] == "DIS":
+
+        # If we arrived here after an earlier question, process yes/no.
+        pending = session.get("pending_symptom")
+
+        if pending:
+            yn = normalize_yes_no(s)
+
+            if yn is True:
+                add_symptoms([pending])
+
+            elif yn is None:
+                # Don't consume an unrelated message as an answer.
+                intent = classify_intent(s)
+
+                if intent == "medical":
+                    extracted = extract_symptoms_from_message(s)
+
+                    if not extracted:
+                        extracted = local_symptom_fallback(s)
+
+                    if extracted:
+                        add_symptoms(extracted)
+                    else:
+                        return (
+                            "Please answer yes or no, or describe the "
+                            "symptom you are experiencing."
+                        )
+                else:
+                    return (
+                        "Please answer <b>yes</b> or <b>no</b>."
+                    )
+
+            session["pending_symptom"] = None
+
+        question = find_next_disease_question()
+
+        if question:
+            session["pending_symptom"] = question
+
+            return (
+                "Are you experiencing <b>" +
+                clean_symp(question) +
+                "</b>? Please answer yes or no."
+            )
+
+        # Current disease cannot be narrowed further.
+        session["step"] = "PREDICT"
+        return get_bot_response()
+
+    # --------------------------------------------------------
+    # IF NO MATCH: ASK FOR MORE SYMPTOMS
+    # --------------------------------------------------------
+    if session["step"] == "MORE_IF_NO_MATCH":
+
+        extracted = extract_symptoms_from_message(s)
+
+        if not extracted:
+            extracted = local_symptom_fallback(s)
+
+        if extracted:
+            add_symptoms(extracted)
+            session["step"] = "PD"
+            return get_bot_response()
+
+        return (
+            "I still couldn't identify a supported symptom. "
+            "Please describe another symptom, such as fever, "
+            "headache, vomiting, cough, stomach pain, or fatigue."
+        )
+
+    # --------------------------------------------------------
+    # PREDICTION
+    # --------------------------------------------------------
+    if session["step"] == "PREDICT":
+
+        prediction = predict_current_symptoms()
+
+        if not prediction:
+            session["step"] = "MORE_IF_NO_MATCH"
+            return (
+                "I couldn't generate a reliable prediction from the "
+                "current symptoms. Please provide another symptom."
+            )
+
+        session["disease"] = prediction
+        session["step"] = "DESCRIPTION"
+
+        return build_final_prediction_response(prediction)
+
+    # --------------------------------------------------------
+    # DESCRIPTION / AI EXPLANATION
+    # --------------------------------------------------------
+    if session["step"] == "DESCRIPTION":
+
+        save_assessment()
+        session["step"] = "SEVERITY"
+
+        disease_name = session["disease"]
+        description = description_list.get(
+            disease_name,
+            "No detailed description is available."
+        )
+
+        return (
+            "<b>About " + disease_name + ":</b><br>" +
+            description +
+            "<br><br>How many days have you had these symptoms?"
+        )
+
+    # --------------------------------------------------------
+    # SEVERITY
+    # --------------------------------------------------------
+    if session["step"] == "SEVERITY":
+
+        try:
+            days = int(s)
+        except ValueError:
+            return (
+                "Please enter the number of days, for example: 3."
+            )
+
+        if days < 1 or days > 3650:
+            return "Please enter a valid number of days."
+
+        session["days"] = days
+        session["step"] = "FINAL"
+
+        try:
+            severe = calc_condition(
+                session.get("all", []),
+                days
+            )
+        except Exception:
+            severe = 0
+
+        if severe == 1:
+            return (
+                "<b>Please consult a qualified healthcare professional.</b>"
+                "<br>Your symptom duration and severity indicate that "
+                "professional medical evaluation is advisable."
+                "<br><br>Tap <b>q</b> to exit."
+            )
+
+        precautions = precautionDictionary.get(
+            session.get("disease"),
+            []
+        )
+
+        message = (
+            "Based on the available information, the model's prediction "
+            "does not indicate a high severity score."
+            "<br><br><b>Precautions:</b><br>"
+        )
+
+        if precautions:
+            for i, precaution in enumerate(precautions, 1):
+                message += f"{i}. {precaution}<br>"
+        else:
+            message += "No specific precautions are available in the dataset.<br>"
+
+        message += (
+            "<br>This is not a medical diagnosis. "
+            "Please consult a healthcare professional if symptoms persist "
+            "or worsen.<br><br>Tap <b>q</b> to end."
+        )
+
+        return message
+
+    # --------------------------------------------------------
+    # FINAL
+    # --------------------------------------------------------
+    if session["step"] == "FINAL":
+        session["step"] = "BYE"
+        return (
+            "Your symptom assessment is complete. "
+            "Would you like to start another assessment? "
+            "(yes or no)"
+        )
+
+    # --------------------------------------------------------
+    # ANOTHER ASSESSMENT
+    # --------------------------------------------------------
+    if session["step"] == "BYE":
+
+        answer = normalize_yes_no(s)
+
+        if answer is True:
+            name = reset_diagnostic_keep_profile()
+            return (
+                "Hello again, " + str(name) +
+                ". Please tell me your main symptom."
+            )
+
+        if answer is False:
+            name = session.get("name", "User")
+            session.clear()
+
+            return (
+                "Thank you, " + str(name) +
+                ", for using Medibot. Take care! "
                 "Please consult a qualified healthcare professional "
                 "for diagnosis or treatment."
             )
 
-    # Safety net: if we somehow fall through every branch above without
-    # returning, don't crash — hand off to Gemini instead of a 500 error.
-    return ai_fallback_response(s or "", "The chatbot's internal state machine did not match a known step.")
+        return "Please answer yes or no."
+
+    # --------------------------------------------------------
+    # SAFETY FALLBACK
+    # --------------------------------------------------------
+    return (
+        "I couldn't continue the assessment from the current "
+        "conversation state. Please refresh the page and start again."
+    )
 
 
 if __name__ == "__main__":
